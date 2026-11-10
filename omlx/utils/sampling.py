@@ -208,11 +208,14 @@ def make_sampler(
     xtc_probability: float = 0.0,
     xtc_threshold: float = 0.0,
     xtc_special_tokens: Optional[List[int]] = None,
+    draw: Optional[Callable[[mx.array, float], mx.array]] = None,
 ) -> Callable[[mx.array], mx.array]:
     """Build a sampler callable matching ``mlx_lm.sample_utils.make_sampler``.
 
     Returns ``argmax`` when ``temp == 0``; otherwise composes optional
     top-p / min-p / xtc / top-k filters and finishes with categorical sampling.
+    ``draw`` replaces the final categorical draw, which is how a seeded request
+    gets a counter draw that no RNG state or batch composition can change.
     """
     if xtc_special_tokens is None:
         xtc_special_tokens = []
@@ -241,6 +244,8 @@ def make_sampler(
         def sampler(logprobs: mx.array) -> mx.array:
             for method in sampling_methods:
                 logprobs = method(logprobs)
+            if draw is not None:
+                return draw(logprobs, temp)
             return categorical_sampling(logprobs, temp)
 
     if temp > 0 and xtc_probability == 0:
@@ -253,7 +258,10 @@ def make_sampler(
         def sample_with_logprobs(logprobs: mx.array, *, rowwise: bool = False):
             # Draft sampling and its acceptance density share the same filters.
             scaled = sampling_logits(logprobs)
-            if rowwise:
+            if draw is not None:
+                # The counter draw advances per row, so it covers both shapes.
+                token = draw(scaled, temp)
+            elif rowwise:
                 token = mx.concatenate(
                     [
                         mx.random.categorical(scaled[row : row + 1])
@@ -287,6 +295,9 @@ def make_sampler(
     sampler.top_k = top_k
     sampler.min_tokens_to_keep = min_tokens_to_keep
     sampler.xtc_probability = xtc_probability
+    # Expose the replacement draw so a downstream seam can reuse it with a
+    # different case namespace without rebuilding the sampler's filters.
+    sampler._omlx_draw = draw
     return sampler
 
 

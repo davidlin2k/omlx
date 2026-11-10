@@ -198,9 +198,9 @@ def test_v41_dspark_config_is_eligible():
 
 
 def test_acceptance_depth_is_independent_of_timing():
-    from omlx.patches.deepseek_v41.mtp import AcceptanceDepthController
+    from omlx.patches.deepseek_v41.mtp import VerifyWidthScheduler
 
-    a, b = AcceptanceDepthController(3), AcceptanceDepthController(3)
+    a, b = VerifyWidthScheduler(3), VerifyWidthScheduler(3)
     depths = []
     for accepted in [0, 1, 2, 3, 1, 0, 1, 2, 3]:
         assert a.cur == b.cur

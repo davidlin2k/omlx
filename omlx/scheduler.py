@@ -53,6 +53,7 @@ from mlx_lm.tokenizer_utils import _byte_decoder
 from mlx_vlm.models import cache as _vlm_cache
 
 from .cache.deepseek_v41_delta import compact_snapshot as compact_deepseek_v41_snapshot
+from .patches.deepseek_v41.sampler_counter import counter_draw_for
 from .cache.deepseek_v41_delta import is_delta as is_deepseek_v41_delta
 from .cache.observability import BoundarySnapshotDiagnostics, CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
@@ -3766,7 +3767,18 @@ class Scheduler:
             xtc_probability=sampling_params.xtc_probability,
             xtc_threshold=sampling_params.xtc_threshold,
             xtc_special_tokens=self._xtc_special_tokens,
+            # A fixed seed replaces the RNG draw with a counter draw, so the
+            # request's tokens cannot change with batch composition.
+            draw=(
+                counter_draw_for(sampling_params.seed)
+                if sampling_params.seed is not None
+                else None
+            ),
         )
+        # Carry the seed on the sampler so the draft-sampler seam can reuse it
+        # with the draft case namespace.
+        if sampling_params.seed is not None:
+            sampler.seed = sampling_params.seed
 
         # Create logits processors for repetition/presence/frequency penalties
         logits_processors = make_logits_processors(

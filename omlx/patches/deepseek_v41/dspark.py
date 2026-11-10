@@ -88,6 +88,44 @@ class ConfidenceHead(nn.Module):
         return (joined @ self.proj.weight.astype(mx.float32).T).squeeze(-1)
 
 
+def confidence_logits(head, head_hidden, embeddings):
+    """Raw acceptance-rate projection per draft position, or None.
+
+    ``cat([hidden, markov]) @ proj.weight.T`` is the published single-pass head
+    before any sigmoid or temperature. A checkpoint without the head returns
+    None so the width policy falls back to fixed depth.
+    """
+    if head is None:
+        return None
+    if isinstance(embeddings, (tuple, list)):
+        if head_hidden.ndim == 3:
+            embeddings = [
+                item[:, 0] if item.ndim == 3 and item.shape[1] == 1 else item
+                for item in embeddings
+            ]
+        stacked = mx.stack(embeddings, axis=1)
+    else:
+        stacked = embeddings
+    if stacked.ndim == 2 and head_hidden.ndim == 3:
+        stacked = stacked[None]
+    joined = mx.concatenate([head_hidden, stacked], axis=-1).astype(mx.float32)
+    return (joined @ head.proj.weight.astype(mx.float32).T).squeeze(-1)
+
+
+def confidence_rates(head, head_hidden, embeddings, *, temperature=1.0):
+    """Acceptance probability per draft position, as DeepInfer's fused head.
+
+    DeepInfer applies ``sigmoid(clamp(z / temperature, -60, 60))`` with a
+    per-draft-step temperature. A miscalibrated head mis-allocates widths but
+    cannot change tokens, because acceptance stays exact.
+    """
+    raw = confidence_logits(head, head_hidden, embeddings)
+    if raw is None:
+        return None
+    temp = max(float(temperature), 1e-6)
+    return mx.sigmoid(mx.clip(raw / temp, -60.0, 60.0))
+
+
 class DSparkBlock(Block):
     def __init__(self, c, stage):
         experts, active = c.get_moe_config(c.n_layers + stage)

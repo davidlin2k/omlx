@@ -178,6 +178,41 @@ def rope(x, positions, config, compressed, inverse=False, quantize=False, heads_
     return quantize_activation(out) if quantize else out
 
 
+def rope_pack(x, positions, config, compressed, bits=8, group_size=32, e4m3_scale=False):
+    """``pack_activation(rope(x, ...))`` in one dispatch on the eligible GPU path.
+
+    The fused kernel is bitwise equal to the pair, so the fallback keeps the
+    reference arithmetic for shapes the kernel does not cover.
+    """
+    params = (
+        config.rope_head_dim,
+        config.compress_rope_theta if compressed else config.rope_theta,
+        config.original_seq_len if compressed else 0,
+        config.rope_factor,
+        config.beta_fast,
+        config.beta_slow,
+    )
+    cos, sin = _rope_table(params, _rope_positions(positions))
+    eligible = (
+        mx.default_device() == mx.gpu
+        and x.size
+        and x.ndim >= 3
+        and x.shape[-1] % 32 == 0
+        and x.shape[-1] % 8 == 0
+        and (bits, group_size, e4m3_scale)
+        in ((8, 32, False), (4, 32, False), (4, 16, True))
+        and x.dtype in (mx.bfloat16, mx.float16, mx.float32)
+        and cos.shape[0] == x.shape[1]
+    )
+    if eligible:
+        from .packed_kv import fused_rope_pack
+
+        return fused_rope_pack(x, cos, sin, bits, group_size, e4m3_scale)
+    return pack_activation(
+        rope(x, positions, config, compressed), bits, group_size, e4m3_scale
+    )
+
+
 def candidate_block_ids(scores, lengths, count, block):
     width = scores.shape[-1]
     if not width:
@@ -278,9 +313,7 @@ class Indexer(nn.Module):
             )
             if latent is not None:
                 pos = range(kv_start // ratio * ratio, kv_end // ratio * ratio, ratio)
-                key = pack_activation(
-                    rope(self.k_norm(self.wk(latent)), pos, c, True), bits=4
-                )
+                key = rope_pack(self.k_norm(self.wk(latent)), pos, c, True, bits=4)
                 previous = growth.append(cache, 3, previous, key, kv_start // ratio)
             shared["index_k"] = cache[3] = previous
         key = shared["index_k"]
@@ -374,7 +407,7 @@ class Attention(nn.Module):
             c,
             bool(ratio),
         )
-        new = pack_activation(rope(self.kv_norm(kv_input), rope_positions, c, bool(ratio)))
+        new = rope_pack(self.kv_norm(kv_input), rope_positions, c, bool(ratio))
         old = cache[1]
         # CED clears the stale window whenever bounded replay skips tokens.
         old_len = min(start, c.window_size, 0 if old is None else int(old.shape[1]))
@@ -414,14 +447,14 @@ class Attention(nn.Module):
                     x, qr, latent, cache, shared, start, ratio, latent_start=ced_kv_start
                 )
             if latent is not None:
-                compressed = rope(
+                compressed = rope_pack(
                     latent,
                     range(kv_start // ratio * ratio, (kv_start + kv_x.shape[1]) // ratio * ratio, ratio),
                     c,
                     True,
-                )
-                compressed = pack_activation(
-                    compressed, bits=4, group_size=16, e4m3_scale=True
+                    bits=4,
+                    group_size=16,
+                    e4m3_scale=True,
                 )
                 shared["kv"] = cache[2] = growth.append(
                     cache, 2, shared["kv"], compressed, kv_start // ratio

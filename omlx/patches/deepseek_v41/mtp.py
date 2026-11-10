@@ -4,20 +4,25 @@
 import mlx.core as mx
 
 from . import growth
+from .width_policy import MAX_VERIFY_WIDTH, Mode
 
 
-class AcceptanceDepthController:
-    """Choose verification shapes from token acceptance, never wall-clock time.
+class VerifyWidthScheduler:
+    """Choose verification rows from the persisted curve plus the confidence head.
 
-    V4.1's quantized backbone can round differently at different row counts.
-    Timing-based scheduling would therefore let system load change greedy text.
-    A rejection retains one lookahead beyond the accepted prefix; fully accepted
-    blocks grow by one until the configured depth is reached.
+    Timing never enters the rule. V4.1's quantized backbone rounds differently at
+    different row counts, so a load-dependent width would let system load change
+    greedy text. The acceptance-only rule stays as the fallback, which keeps a
+    checkpoint without a confidence head, or a run without a persisted curve,
+    byte-for-byte on today's behavior.
     """
 
-    def __init__(self, depth):
+    def __init__(self, depth, *, curve=None, mode=Mode.TURBO, rows=1):
         self.max_depth = max(1, int(depth))
         self.cur = self.max_depth
+        self.curve = curve
+        self.mode = mode
+        self.rows = max(1, int(rows))
         self._warmup = False
         self.exit_streak = 0
         self.t = {}
@@ -29,6 +34,28 @@ class AcceptanceDepthController:
     def should_exit(self):
         # Timing-based handoff would also change the subsequent numeric path.
         return False
+
+    def width_for(self, confidence):
+        """Verify rows for one row's next chain, inside decode_fused.MAX_BATCH.
+
+        The width maximizes expected tokens per measured millisecond, the same
+        objective as DeepInfer's MTPVarlen. With no curve, no confidence, or the
+        deterministic mode, the acceptance-only fallback applies.
+        """
+        fallback = max(1, min(self.cur, MAX_VERIFY_WIDTH))
+        if self.mode is Mode.DETERMINISTIC or confidence is None or self.curve is None:
+            return fallback
+        rates = mx.cumprod(confidence.reshape(-1).astype(mx.float32)).tolist()
+        best_width, best_ratio = 1, 0.0
+        for width in range(1, min(MAX_VERIFY_WIDTH, len(rates) + 1) + 1):
+            cost = self.curve.ms(width, self.rows)
+            if cost is None or cost <= 0:
+                continue
+            expected = 1.0 + sum(rates[: width - 1])
+            ratio = expected / cost
+            if ratio > best_ratio:
+                best_ratio, best_width = ratio, width
+        return max(1, min(best_width, MAX_VERIFY_WIDTH))
 
 
 class DSparkMixin:
@@ -73,7 +100,7 @@ class DSparkMixin:
                 object.__setattr__(layer, "_omlx_verify_exact", bool(enabled))
 
     def make_mtp_depth_controller(self, depth):
-        return AcceptanceDepthController(depth)
+        return VerifyWidthScheduler(depth)
 
     def make_mtp_cache(self):
         return self.make_dspark_cache()
@@ -93,6 +120,20 @@ class DSparkMixin:
 
     def dspark_markov(self, token_ids):
         return self.mtp[-1].markov_head(token_ids)
+
+    def dspark_confidence_raw(self, head_hidden, embeddings):
+        """Raw acceptance-rate projection per draft position, or None."""
+        from .dspark import confidence_logits
+
+        head = getattr(self.mtp[-1], "confidence_head", None)
+        return confidence_logits(head, head_hidden, embeddings)
+
+    def dspark_confidence(self, head_hidden, embeddings, *, temperature=1.0):
+        """Acceptance probability per draft position, as DeepInfer's fused head."""
+        from .dspark import confidence_rates
+
+        head = getattr(self.mtp[-1], "confidence_head", None)
+        return confidence_rates(head, head_hidden, embeddings, temperature=temperature)
 
     def mtp_forward(
         self, hidden, input_ids, cache=None, return_hidden=False, logits_keep=0

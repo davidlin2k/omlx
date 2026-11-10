@@ -538,6 +538,24 @@ def _patch_model(dsv4: Any) -> None:
 
         return dspark_head_gemv(head.markov_w2, embedding), embedding
 
+    def dspark_confidence_raw(self, head_hidden, embeddings):
+        """Raw acceptance-rate projection per draft position, or None.
+
+        Delegates to the single confidence decision in the V4.1 patch so both
+        DSpark mixins share one formula.
+        """
+        from omlx.patches.deepseek_v41.dspark import confidence_logits
+
+        head = getattr(self.mtp[-1], "confidence_head", None)
+        return confidence_logits(head, head_hidden, embeddings)
+
+    def dspark_confidence(self, head_hidden, embeddings, *, temperature=1.0):
+        """Acceptance probability per draft position, as DeepInfer's fused head."""
+        from omlx.patches.deepseek_v41.dspark import confidence_rates
+
+        head = getattr(self.mtp[-1], "confidence_head", None)
+        return confidence_rates(head, head_hidden, embeddings, temperature=temperature)
+
     def dspark_calibration_forward(self, target_hiddens, input_ids):
         """Exercise all DSpark linears for oQe imatrix collection."""
         if not getattr(self, "_omlx_dspark_decode_enabled", False):

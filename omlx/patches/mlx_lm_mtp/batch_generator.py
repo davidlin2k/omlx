@@ -943,6 +943,11 @@ class _MtpState:
     # drafts the next chain builds from rolling accept/latency estimates.
     controller: Optional[Any] = None
 
+    # Acceptance probability per draft position from the DSpark confidence head.
+    # Lazy (rows, depth) fp32, or None for a checkpoint without the head. The
+    # width policy reads it in the next cycle's single sync.
+    confidence: Optional[Any] = None
+
     # True while this state is a bounded re-entry probe after a performance
     # handoff. Correctness fallbacks and late-join handoffs do not set it.
     reentry_probe: bool = False
@@ -3065,12 +3070,22 @@ def _resolve_draft_sampler(gen_batch: Any, state: _MtpState):
     from omlx.utils.sampling import make_sampler
 
     target = _resolve_sampler(gen_batch)
+    seed = getattr(target, "seed", None)
+    if seed is not None:
+        from omlx.patches.deepseek_v41.sampler_counter import (
+            CASE_DRAFT,
+            counter_draw_for,
+        )
+
     state.draft_sampler = make_sampler(
         temp=getattr(target, "temp", _DRAFT_SAMPLER_TEMP),
         top_p=getattr(target, "top_p", _DRAFT_SAMPLER_TOP_P),
         top_k=getattr(target, "top_k", _DRAFT_SAMPLER_TOP_K),
         min_p=getattr(target, "min_p", 0.0),
         min_tokens_to_keep=getattr(target, "min_tokens_to_keep", 1),
+        draw=(
+            counter_draw_for(seed, CASE_DRAFT) if seed is not None else None
+        ),
     )
     return state.draft_sampler
 
@@ -3110,6 +3125,12 @@ def _dspark_next_drafts(
 
     if depth is None:
         depth = state.controller.cur if state.controller is not None else state.depth
+    # One cycle of lead: the confidence of the drafts built in the previous SPEC
+    # chooses this cycle's verify rows. With no curve, no confidence, or the
+    # deterministic mode, the controller's acceptance rule applies unchanged.
+    width_for = getattr(state.controller, "width_for", None)
+    if state.confidence is not None and callable(width_for):
+        depth = max(0, int(width_for(state.confidence)) - 1)
     depth = min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
     n = int(committed.shape[0])
     if depth <= 0:
@@ -3118,10 +3139,11 @@ def _dspark_next_drafts(
         state.drafts = mx.zeros((0,), dtype=mx.uint32)
         state.draft_lps = []
         state.draft_accept_lps = []
+        state.confidence = None
         return
 
     anchor = committed[-1:].reshape(1, 1)
-    logits, _ = host.dspark_forward(
+    logits, head_hidden = host.dspark_forward(
         hidden_rows,
         anchor,
         state.mtp_cache,
@@ -3134,6 +3156,7 @@ def _dspark_next_drafts(
     draft_toks: List[Any] = []
     draft_lps: List[Any] = []
     draft_accept_lps: List[Any] = []
+    embeddings: List[Any] = []
     previous = anchor.reshape(1)
 
     # Drafts are speculative — processor calls shape the draft
@@ -3143,7 +3166,8 @@ def _dspark_next_drafts(
     snap = _snap_snapshotable(procs)
 
     for idx in range(depth):
-        bias, _ = host.dspark_markov(previous)
+        bias, embedding = host.dspark_markov(previous)
+        embeddings.append(embedding)
         logits_2d = logits[:, idx, :] + bias
         if procs is not None and prev_buf is not None:
             prefix = mx.concatenate(
@@ -3159,6 +3183,16 @@ def _dspark_next_drafts(
         previous = token.reshape(1)
 
     _restore_snapshotable(procs, snap)
+
+    # The confidence of this cycle's drafts sets the next cycle's widths, one
+    # cycle of lead, so the policy never waits on a mid-cycle GPU read.
+    if head_hidden is not None and embeddings:
+        confidence = getattr(host, "dspark_confidence", None)
+        state.confidence = (
+            None if confidence is None else confidence(head_hidden, embeddings)
+        )
+    else:
+        state.confidence = None
 
     state.drafts = mx.concatenate(draft_toks)
     state.draft_lps = draft_lps
@@ -3220,6 +3254,7 @@ def _chain_next_drafts(
         state.drafts = mx.zeros((0,), dtype=mx.uint32)
         state.draft_lps = []
         state.draft_accept_lps = []
+        state.confidence = None
         return
 
     hidden_rows = _head_input(model, hidden_rows)
